@@ -98,7 +98,7 @@ sorts date DESC, caps at 200, returns `{ state, freshOnes }` where freshOnes = t
 - `refresh()` — force poll now
 - `openExternal(url)`
 - `setCollapsed(bool)` — main resizes window (collapsed: 36px wide; expanded: 400px), renderer toggles body class
-- `quit()`
+- `quit()` — hides to tray (close-to-tray by design; real quit lives in the tray context menu)
 
 Snapshot = `{ tickets: Ticket[], prs: PR[], notifications: Notification[], unread: number, lastSync: ISO|null, polling: bool, errors: string[] }`
 

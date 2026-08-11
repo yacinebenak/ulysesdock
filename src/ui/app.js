@@ -12,6 +12,11 @@
     openExternal: noop,
     setCollapsed: noop,
     quit: noop,
+    ticketDetail: function () { return Promise.reject(new Error('bridge missing')); },
+    postComment: function () { return Promise.reject(new Error('bridge missing')); },
+    getStandup: function () { return Promise.resolve({ sinceIso: null, sinceLabel: 'hier', commits: [] }); },
+    copyText: noop,
+    setupSave: function () { return Promise.resolve({ ok: false }); },
   }, window.workdock || {});
 
   // ---------- helpers ----------

@@ -173,6 +173,12 @@ async function fetchMyPRs(cfg) {
     return full;
   });
 
+  // Evict cache entries for PRs no longer open (merged/declined/removed).
+  const openKeys = new Set(openListed.map(({ repo, pr }) => repo + '#' + pr.id));
+  for (const key of prDetailCache.keys()) {
+    if (!openKeys.has(key)) prDetailCache.delete(key);
+  }
+
   const prs = open.concat(closed);
   prs.sort((a, b) => (Date.parse(b.created) || 0) - (Date.parse(a.created) || 0));
   return prs;

@@ -85,38 +85,49 @@ async function poll() {
   } catch (e) {
     errors.push('Bitbucket PRs: ' + e.message);
   }
+  let activityOk = true;
   try {
     const watchlist = await jira.buildWatchlist(cfg);
     incoming = incoming.concat(await jira.fetchActivity(cfg, watchlist, sinceIso));
   } catch (e) {
+    activityOk = false;
     errors.push('Jira activity: ' + e.message);
   }
   try {
     const openPrs = prs.filter((p) => p.state === 'OPEN');
     incoming = incoming.concat(await bitbucket.fetchPRActivity(cfg, openPrs, sinceIso));
   } catch (e) {
+    activityOk = false;
     errors.push('PR activity: ' + e.message);
   }
 
-  const ignored = (cfg.ignoreAuthors || []).map((a) => a.toLowerCase());
-  incoming = incoming.filter((n) => !ignored.includes(String(n.author || '').toLowerCase()));
+  try {
+    const ignored = (cfg.ignoreAuthors || []).map((a) => a.toLowerCase());
+    incoming = incoming.filter((n) => !ignored.includes(String(n.author || '').toLowerCase()));
 
-  const { state: newState, freshOnes } = mergeNotifications(state, incoming);
-  state = newState;
-  state.lastPollIso = new Date().toISOString();
-  saveState(userDataDir(), state);
+    const { state: newState, freshOnes } = mergeNotifications(state, incoming);
+    state = newState;
+    // Only advance the watermark when both activity fetches succeeded, so an
+    // outage window is re-scanned on recovery instead of silently skipped.
+    if (activityOk) state.lastPollIso = new Date().toISOString();
+    saveState(userDataDir(), state);
 
-  for (const n of freshOnes.slice(0, 5)) {
-    try {
-      const toast = new Notification({ title: n.title, body: (n.text || n.kind).slice(0, 120), silent: false });
-      toast.on('click', () => shell.openExternal(n.url));
-      toast.show();
-    } catch (_) { /* toasts are best-effort */ }
+    for (const n of freshOnes.slice(0, 5)) {
+      try {
+        const toast = new Notification({ title: n.title, body: (n.text || n.kind).slice(0, 120), silent: false });
+        toast.on('click', () => {
+          if (typeof n.url === 'string' && /^https:\/\//.test(n.url)) shell.openExternal(n.url);
+        });
+        toast.show();
+      } catch (_) { /* toasts are best-effort */ }
+    }
+  } catch (e) {
+    errors.push('State: ' + e.message);
+  } finally {
+    polling = false;
+    buildSnapshot({ tickets, prs, errors });
+    pushSnapshot();
   }
-
-  polling = false;
-  buildSnapshot({ tickets, prs, errors });
-  pushSnapshot();
 }
 
 function applyBounds() {
@@ -195,6 +206,14 @@ function startPolling() {
   pollTimer = setInterval(poll, cfg.pollIntervalMs);
 }
 
+// Single instance: a second launch just reveals the existing window.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+}
+app.on('second-instance', () => {
+  if (win && !win.isDestroyed()) setHidden(false);
+});
+
 app.whenReady().then(async () => {
   migrateLegacyUserData();
   state = loadState(userDataDir());
@@ -231,10 +250,12 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('app:quit', () => setHidden(true));
   ipcMain.handle('ticket:detail', (_e, key) => {
+    if (!cfg || cfg.needsSetup) throw new Error('Configuration incomplète');
     if (!/^[A-Z][A-Z0-9]+-\d+$/.test(String(key))) throw new Error('Invalid ticket key');
     return jira.fetchTicketDetail(cfg, String(key));
   });
   ipcMain.handle('ticket:comment', async (_e, key, text) => {
+    if (!cfg || cfg.needsSetup) throw new Error('Configuration incomplète');
     if (!/^[A-Z][A-Z0-9]+-\d+$/.test(String(key))) throw new Error('Invalid ticket key');
     const body = String(text || '').trim();
     if (!body) throw new Error('Empty comment');

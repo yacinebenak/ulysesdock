@@ -42,6 +42,10 @@ function gitCredentialFill(host) {
     input: `protocol=https\nhost=${host}\n\n`,
     encoding: 'utf8',
     windowsHide: true,
+    timeout: 5000,
+    // Never let the credential manager pop an interactive login dialog
+    // (it would freeze the main process on machines with no stored credential).
+    env: { ...process.env, GCM_INTERACTIVE: 'never', GIT_TERMINAL_PROMPT: '0' },
   });
   if (res.status !== 0) return null;
   const out = {};
