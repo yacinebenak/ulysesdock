@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'">
+  <title>UlysesDock</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- Collapsed 36px rail -->
+  <aside id="rail">
+    <button id="expand-btn" class="icon-btn" title="Expand panel">&lt;=</button>
+    <span id="rail-badge" class="badge"></span>
+    <div id="rail-title">UlysesDock</div>
+  </aside>
+
+  <!-- Expanded 400px panel -->
+  <div id="panel">
+    <header id="topbar">
+      <span id="app-title">UlysesDock</span>
+      <span id="sync-label" class="muted small">sync &#8212;</span>
+      <span class="spacer"></span>
+      <button id="refresh-btn" class="icon-btn" title="Refresh now">&#10227;</button>
+      <button id="collapse-btn" class="icon-btn" title="Collapse to rail">=&gt;</button>
+      <button id="quit-btn" class="icon-btn quit" title="Quitter UlysesDock">&#10005;</button>
+    </header>
+
+    <nav id="tabstrip">
+      <button id="tab-today" class="tab active">Récap</button>
+      <button id="tab-prs" class="tab">PRs</button>
+      <button id="tab-tickets" class="tab">Tickets</button>
+      <button id="tab-notifs" class="tab">Notifs&nbsp;<span id="tab-badge" class="badge"></span></button>
+    </nav>
+
+    <main id="content">
+      <section id="panel-today" class="panel active">
+        <div id="today-scroll" class="panel-scroll"></div>
+      </section>
+      <section id="panel-prs" class="panel">
+        <div id="prs-filters" class="filter-bar hidden"></div>
+        <div id="prs-scroll" class="panel-scroll"></div>
+      </section>
+      <section id="panel-tickets" class="panel">
+        <div id="tickets-filters" class="filter-bar hidden"></div>
+        <div id="tickets-scroll" class="panel-scroll"></div>
+      </section>
+      <section id="panel-notifs" class="panel">
+        <div id="notif-tools" class="filter-bar panel-tools hidden">
+          <button id="clear-all" class="link-btn">Clear all</button>
+        </div>
+        <div id="notif-list" class="panel-scroll"></div>
+      </section>
+    </main>
+
+    <div id="setup"></div>
+
+    <footer id="error-strip" class="hidden"><span id="error-text"></span></footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
