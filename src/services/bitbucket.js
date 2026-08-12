@@ -92,8 +92,16 @@ function mapPR(repo, pr) {
 }
 
 /**
- * Newest non-deleted comment on a PR whose author is not a bot
+ * Newest non-deleted, NON-RESOLVED comment on a PR whose author is not a bot
  * (cfg.ignoreAuthors). My own comments DO count (isMine: true).
+ *
+ * Bitbucket marks a resolved thread by the PRESENCE of a `resolution` key on
+ * the thread's top-level comment (the key is absent on unresolved ones).
+ * Replies inherit their root comment's resolution. Resolved threads are
+ * answered feedback — they must not flag a PR as awaiting a reply.
+ *
+ * Returns { last, hadResolvedThreads } — the second flag distinguishes
+ * "feedback existed but was all addressed" from "nobody ever commented".
  * First page of comments sorted newest-first is enough.
  */
 async function fetchLastHumanComment(cfg, repo, id) {
@@ -102,25 +110,47 @@ async function fetchLastHumanComment(cfg, repo, id) {
     repoBase(cfg, repo) + '/pullrequests/' + id + '/comments?pagelen=50&sort=-created_on',
     [404]
   );
-  if (res.status === 404) return null;
+  if (res.status === 404) return { last: null, hadResolvedThreads: false };
   const data = await res.json();
-  for (const c of data.values || []) {
+  const all = data.values || [];
+  const byId = new Map(all.map((c) => [c.id, c]));
+
+  const isResolved = (c) => {
+    let node = c;
+    for (let hops = 0; node && hops < 20; hops++) {
+      if (!node.parent) return 'resolution' in node;
+      node = byId.get(node.parent.id);
+    }
+    // Root is on an older page we didn't fetch — treat as unresolved (safe default).
+    return false;
+  };
+
+  let last = null;
+  let hadResolvedThreads = false;
+  for (const c of all) {
     if (c.deleted) continue;
     if (isIgnoredAuthor(cfg, c.user)) continue;
-    return {
-      author: (c.user && c.user.display_name) || 'Unknown',
-      date: c.created_on || '',
-      isMine: isMe(cfg, c.user),
-    };
+    if (isResolved(c)) {
+      hadResolvedThreads = true;
+      continue;
+    }
+    if (!last) {
+      last = {
+        author: (c.user && c.user.display_name) || 'Unknown',
+        date: c.created_on || '',
+        isMine: isMe(cfg, c.user),
+      };
+    }
   }
-  return null;
+  return { last, hadResolvedThreads };
 }
 
 /** Review-state precedence: awaiting_me > approved > awaiting_reviewers > unreviewed. */
-function computeReviewState(approvals, lastHumanComment) {
+function computeReviewState(approvals, lastHumanComment, hadResolvedThreads) {
   if (lastHumanComment && !lastHumanComment.isMine) return 'awaiting_me';
   if (approvals >= 1) return 'approved';
-  if (lastHumanComment) return 'awaiting_reviewers';
+  // Either I spoke last, or all feedback threads were resolved — ball is with reviewers.
+  if (lastHumanComment || hadResolvedThreads) return 'awaiting_reviewers';
   return 'unreviewed';
 }
 
@@ -167,8 +197,9 @@ async function fetchMyPRs(cfg) {
     if (cached && cached.updated === pr.updated_on) return cached.pr;
     const res = await bbFetch(cfg, repoBase(cfg, repo) + '/pullrequests/' + pr.id);
     const full = mapPR(repo, await res.json());
-    full.lastHumanComment = await fetchLastHumanComment(cfg, repo, pr.id);
-    full.reviewState = computeReviewState(full.approvals, full.lastHumanComment);
+    const { last, hadResolvedThreads } = await fetchLastHumanComment(cfg, repo, pr.id);
+    full.lastHumanComment = last;
+    full.reviewState = computeReviewState(full.approvals, last, hadResolvedThreads);
     prDetailCache.set(cacheKey, { updated: pr.updated_on, pr: full });
     return full;
   });
