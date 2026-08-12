@@ -1,7 +1,7 @@
 {
   "name": "ulysesdock",
   "productName": "UlysesDock",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Side-docked Jira + Bitbucket work monitor for the Ulyses team",
   "main": "src/main.js",
   "author": "Yacine Benakmoume",
@@ -42,5 +42,8 @@
       "owner": "yacinebenak",
       "repo": "ulysesdock"
     }
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
   }
 }

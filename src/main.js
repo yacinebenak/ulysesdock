@@ -1,9 +1,10 @@
 'use strict';
 
 const { app, BrowserWindow, ipcMain, shell, screen, Notification, clipboard, Tray, Menu, nativeImage, globalShortcut } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path = require('path');
 const fs = require('fs');
-const { loadConfig, saveSetup } = require('./config');
+const { loadConfig, saveSetup, saveSettings, POLL_CHOICES_MS } = require('./config');
 const jira = require('./services/jira');
 const bitbucket = require('./services/bitbucket');
 const local = require('./services/local');
@@ -15,6 +16,7 @@ const COLLAPSED_W = 36;
 let win = null;
 let tray = null;
 let quitting = false;
+let updateReady = false;
 let cfg = null;
 let state = null;
 let pollTimer = null;
@@ -64,6 +66,30 @@ function pushSnapshot() {
   if (win && !win.isDestroyed()) win.webContents.send('snapshot:update', buildSnapshot());
 }
 
+// notifyTypes: comment/status/assign map to a Jira notification kind
+// directly; anything from Bitbucket (pr-comment/pr-approval/pr-changes) is
+// grouped under the single "prActivity" toggle.
+function notifyTypeEnabled(n) {
+  const t = (cfg && cfg.settings && cfg.settings.notifyTypes) || {};
+  if (n.source === 'bitbucket') return t.prActivity !== false;
+  if (n.kind === 'comment') return t.comment !== false;
+  if (n.kind === 'status') return t.status !== false;
+  if (n.kind === 'assign') return t.assign !== false;
+  return true;
+}
+
+function isInQuietHours(quietHours) {
+  if (!quietHours || !quietHours.enabled) return false;
+  const now = new Date();
+  const mins = now.getHours() * 60 + now.getMinutes();
+  const [sh, sm] = String(quietHours.start).split(':').map(Number);
+  const [eh, em] = String(quietHours.end).split(':').map(Number);
+  const start = sh * 60 + sm;
+  const end = eh * 60 + em;
+  if (Number.isNaN(start) || Number.isNaN(end)) return false;
+  return start <= end ? (mins >= start && mins < end) : (mins >= start || mins < end);
+}
+
 async function poll() {
   if (polling || !cfg || cfg.needsSetup) return;
   polling = true;
@@ -88,7 +114,9 @@ async function poll() {
   let activityOk = true;
   try {
     const watchlist = await jira.buildWatchlist(cfg);
-    incoming = incoming.concat(await jira.fetchActivity(cfg, watchlist, sinceIso));
+    const manual = Array.isArray(state.watchedKeys) ? state.watchedKeys : [];
+    const keys = Array.from(new Set(watchlist.concat(manual)));
+    incoming = incoming.concat(await jira.fetchActivity(cfg, keys, sinceIso));
   } catch (e) {
     activityOk = false;
     errors.push('Jira activity: ' + e.message);
@@ -104,6 +132,7 @@ async function poll() {
   try {
     const ignored = (cfg.ignoreAuthors || []).map((a) => a.toLowerCase());
     incoming = incoming.filter((n) => !ignored.includes(String(n.author || '').toLowerCase()));
+    incoming = incoming.filter((n) => notifyTypeEnabled(n));
 
     const { state: newState, freshOnes } = mergeNotifications(state, incoming);
     state = newState;
@@ -112,14 +141,17 @@ async function poll() {
     if (activityOk) state.lastPollIso = new Date().toISOString();
     saveState(userDataDir(), state);
 
-    for (const n of freshOnes.slice(0, 5)) {
-      try {
-        const toast = new Notification({ title: n.title, body: (n.text || n.kind).slice(0, 120), silent: false });
-        toast.on('click', () => {
-          if (typeof n.url === 'string' && /^https:\/\//.test(n.url)) shell.openExternal(n.url);
-        });
-        toast.show();
-      } catch (_) { /* toasts are best-effort */ }
+    const settings = (cfg && cfg.settings) || {};
+    if (settings.toastsEnabled !== false && !isInQuietHours(settings.quietHours)) {
+      for (const n of freshOnes.slice(0, 5)) {
+        try {
+          const toast = new Notification({ title: n.title, body: (n.text || n.kind).slice(0, 120), silent: false });
+          toast.on('click', () => {
+            if (typeof n.url === 'string' && /^https:\/\//.test(n.url)) shell.openExternal(n.url);
+          });
+          toast.show();
+        } catch (_) { /* toasts are best-effort */ }
+      }
     }
   } catch (e) {
     errors.push('State: ' + e.message);
@@ -133,7 +165,9 @@ async function poll() {
 function applyBounds() {
   const area = screen.getPrimaryDisplay().workArea;
   const w = collapsed ? COLLAPSED_W : EXPANDED_W;
-  win.setBounds({ x: area.x + area.width - w, y: area.y, width: w, height: area.height });
+  const side = (cfg && cfg.settings && cfg.settings.dockSide) || 'right';
+  const x = side === 'left' ? area.x : area.x + area.width - w;
+  win.setBounds({ x, y: area.y, width: w, height: area.height });
 }
 
 function createWindow() {
@@ -173,6 +207,9 @@ function setHidden(hidden) {
   if (!win || win.isDestroyed()) return;
   if (hidden) {
     win.hide();
+    // Nobody is looking — a downloaded update can be applied right now
+    // instead of waiting for the next full quit.
+    if (updateReady) autoUpdater.quitAndInstall(false, true);
   } else {
     applyBounds();
     win.show();
@@ -211,6 +248,43 @@ function startPolling() {
   pollTimer = setInterval(poll, cfg.pollIntervalMs);
 }
 
+// Start with Windows. Packaged builds register their own exe; when running
+// from source, register electron.exe with the app directory as argument.
+function applyLoginItem(enabled) {
+  try {
+    const loginSettings = { openAtLogin: !!enabled };
+    if (!app.isPackaged) {
+      loginSettings.path = process.execPath;
+      loginSettings.args = [path.resolve(__dirname, '..')];
+    }
+    app.setLoginItemSettings(loginSettings);
+  } catch (e) {
+    console.error('Could not update login item:', e.message);
+  }
+}
+
+const UPDATE_CHECK_MS = 4 * 60 * 60 * 1000;
+
+function setupAutoUpdate() {
+  // Meaningless (and noisy — throws looking for app-update.yml) outside a
+  // real installed build; running `npm start` from source never updates.
+  if (!app.isPackaged) return;
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.on('update-downloaded', () => {
+    updateReady = true;
+    if (state.hidden) autoUpdater.quitAndInstall(false, true);
+  });
+  autoUpdater.on('error', (err) => {
+    console.error('Auto-update error:', err.message);
+  });
+  const check = () => autoUpdater.checkForUpdates().catch((err) => {
+    console.error('Update check failed:', err.message);
+  });
+  check();
+  setInterval(check, UPDATE_CHECK_MS);
+}
+
 // Single instance: a second launch just reveals the existing window.
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -228,6 +302,7 @@ app.whenReady().then(async () => {
   state.notifications = state.notifications.filter(
     (n) => !ignoredAtBoot.includes(String(n.author || '').toLowerCase())
   );
+  if (cfg && cfg.settings && cfg.settings.startHidden) state.hidden = true;
 
   ipcMain.handle('snapshot:get', () => buildSnapshot());
   ipcMain.handle('notif:dismiss', (_e, id) => {
@@ -265,6 +340,13 @@ app.whenReady().then(async () => {
     const body = String(text || '').trim();
     if (!body) throw new Error('Empty comment');
     await jira.postComment(cfg, String(key), body);
+    // Commenting on a ticket counts as "touching" it — future activity on it
+    // must generate notifications even if it's never assigned to me.
+    if (!Array.isArray(state.watchedKeys)) state.watchedKeys = [];
+    if (!state.watchedKeys.includes(key)) {
+      state.watchedKeys.push(key);
+      saveState(userDataDir(), state);
+    }
     return true;
   });
   ipcMain.handle('backlog:get', () =>
@@ -289,6 +371,23 @@ app.whenReady().then(async () => {
     }
     return result;
   });
+  ipcMain.handle('settings:get', () => ({
+    ...(cfg && cfg.settings ? cfg.settings : {}),
+    repos: cfg && cfg.bitbucket ? cfg.bitbucket.repos : [],
+    pollChoices: POLL_CHOICES_MS,
+  }));
+  ipcMain.handle('settings:save', async (_e, partial) => {
+    if (!cfg || cfg.needsSetup) throw new Error('Configuration incomplète');
+    const result = await saveSettings(userDataDir(), partial || {});
+    if (result.ok) {
+      cfg = await loadConfig(userDataDir());
+      applyLoginItem(cfg.settings.startAtLogin);
+      startPolling(); // restarts the interval timer at the (possibly new) pollIntervalMs
+      applyBounds(); // reflects a dockSide change immediately
+      pushSnapshot();
+    }
+    return result;
+  });
 
   createWindow();
   createTray();
@@ -298,20 +397,10 @@ app.whenReady().then(async () => {
     }
   }
 
-  // Start with Windows. Packaged builds register their own exe; when running
-  // from source, register electron.exe with the app directory as argument.
-  try {
-    const loginSettings = { openAtLogin: true };
-    if (!app.isPackaged) {
-      loginSettings.path = process.execPath;
-      loginSettings.args = [path.resolve(__dirname, '..')];
-    }
-    app.setLoginItemSettings(loginSettings);
-  } catch (e) {
-    console.error('Could not register login item:', e.message);
-  }
+  applyLoginItem(cfg && cfg.settings ? cfg.settings.startAtLogin : true);
 
   if (!cfg.needsSetup) startPolling();
+  setupAutoUpdate();
 });
 
 app.on('window-all-closed', () => {

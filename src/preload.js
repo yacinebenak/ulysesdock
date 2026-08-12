@@ -20,4 +20,6 @@ contextBridge.exposeInMainWorld('workdock', {
   setupSave: (payload) => ipcRenderer.invoke('setup:save', payload),
   getBacklog: () => ipcRenderer.invoke('backlog:get'),
   assignToMe: (key) => ipcRenderer.invoke('backlog:assign', key),
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  saveSettings: (partial) => ipcRenderer.invoke('settings:save', partial),
 });

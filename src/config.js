@@ -12,6 +12,50 @@ const DEFAULTS = {
   ignoreAuthors: ['UlysesSuite', 'CloudPMS'],
 };
 
+const POLL_CHOICES_MS = [15000, 30000, 60000, 120000, 300000];
+
+const SETTINGS_DEFAULTS = {
+  startAtLogin: true,
+  startHidden: false,
+  dockSide: 'right', // 'left' | 'right'
+  pollIntervalMs: DEFAULTS.pollIntervalMs,
+  ignoreAuthors: DEFAULTS.ignoreAuthors.slice(),
+  quietHours: { enabled: false, start: '12:30', end: '14:00' },
+  notifyTypes: { comment: true, status: true, assign: true, prActivity: true },
+  toastsEnabled: true,
+};
+
+function isHHMM(s) {
+  return typeof s === 'string' && /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
+}
+
+function normalizeSettings(raw) {
+  const r = raw || {};
+  const qh = r.quietHours || {};
+  const nt = r.notifyTypes || {};
+  return {
+    startAtLogin: typeof r.startAtLogin === 'boolean' ? r.startAtLogin : SETTINGS_DEFAULTS.startAtLogin,
+    startHidden: typeof r.startHidden === 'boolean' ? r.startHidden : SETTINGS_DEFAULTS.startHidden,
+    dockSide: r.dockSide === 'left' ? 'left' : 'right',
+    pollIntervalMs: POLL_CHOICES_MS.includes(Number(r.pollIntervalMs)) ? Number(r.pollIntervalMs) : SETTINGS_DEFAULTS.pollIntervalMs,
+    ignoreAuthors: Array.isArray(r.ignoreAuthors) && r.ignoreAuthors.length
+      ? r.ignoreAuthors.map(String).map((s) => s.trim()).filter(Boolean)
+      : SETTINGS_DEFAULTS.ignoreAuthors.slice(),
+    quietHours: {
+      enabled: !!qh.enabled,
+      start: isHHMM(qh.start) ? qh.start : SETTINGS_DEFAULTS.quietHours.start,
+      end: isHHMM(qh.end) ? qh.end : SETTINGS_DEFAULTS.quietHours.end,
+    },
+    notifyTypes: {
+      comment: nt.comment !== false,
+      status: nt.status !== false,
+      assign: nt.assign !== false,
+      prActivity: nt.prActivity !== false,
+    },
+    toastsEnabled: r.toastsEnabled !== false,
+  };
+}
+
 // Legacy bootstrap (first machine only): Yacine's jira_grabber script.
 const LEGACY_JIRA_SCRIPT = path.join(
   process.env.USERPROFILE || '',
@@ -106,23 +150,33 @@ async function testJira(baseUrl, email, token) {
   }
 }
 
-async function testBitbucket(token, workspace, repo) {
+async function testRepoAccess(token, workspace, repo) {
   try {
-    const me = await fetchJson('https://api.bitbucket.org/2.0/user', {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-    });
     await fetchJson(`https://api.bitbucket.org/2.0/repositories/${workspace}/${repo}?fields=name`, {
       Authorization: `Bearer ${token}`,
       Accept: 'application/json',
     });
-    return { ok: true, uuid: me.uuid, displayName: me.display_name };
+    return { ok: true };
   } catch (e) {
     return {
       ok: false,
       error: e.status === 401 ? 'Token Bitbucket invalide' :
         e.status === 403 || e.status === 404 ? `Pas d'accès au repo ${workspace}/${repo}` : e.message,
     };
+  }
+}
+
+async function testBitbucket(token, workspace, repo) {
+  try {
+    const me = await fetchJson('https://api.bitbucket.org/2.0/user', {
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/json',
+    });
+    const repoCheck = await testRepoAccess(token, workspace, repo);
+    if (!repoCheck.ok) return repoCheck;
+    return { ok: true, uuid: me.uuid, displayName: me.display_name };
+  } catch (e) {
+    return { ok: false, error: e.status === 401 ? 'Token Bitbucket invalide' : e.message };
   }
 }
 
@@ -213,6 +267,32 @@ async function saveSetup(userDataDir, payload) {
 }
 
 /**
+ * Merges and persists a partial settings payload. Also re-validates Bitbucket
+ * repos when they changed (same check the setup wizard runs), so a typo
+ * can't silently break polling. Returns { ok, settings, error? }.
+ */
+async function saveSettings(userDataDir, partial) {
+  const stored = readJson(configPath(userDataDir));
+  if (!stored) return { ok: false, error: 'Configuration introuvable' };
+
+  const merged = normalizeSettings({ ...normalizeSettings(stored.settings), ...(partial || {}) });
+
+  if (Array.isArray(partial && partial.repos) && partial.repos.length) {
+    const repos = partial.repos.map(String).map((s) => s.trim()).filter(Boolean);
+    const bbToken = resolveBitbucketToken(stored);
+    if (!bbToken) return { ok: false, error: 'Bitbucket: Token Bitbucket introuvable' };
+    const checks = await Promise.all(repos.map((r) => testRepoAccess(bbToken, stored.bitbucket.workspace, r)));
+    const failed = checks.find((c) => !c.ok);
+    if (failed) return { ok: false, error: 'Bitbucket: ' + failed.error };
+    stored.bitbucket.repos = repos;
+  }
+
+  stored.settings = merged;
+  writeJson(configPath(userDataDir), stored);
+  return { ok: true, settings: merged, repos: stored.bitbucket.repos.slice() };
+}
+
+/**
  * Loads runtime config. Returns { needsSetup: true } when no usable config exists.
  * Runtime shape consumed by services:
  * { jira: {baseUrl, email, token, myAccountId}, bitbucket: {workspace, repos, token, myUuid},
@@ -232,6 +312,7 @@ async function loadConfig(userDataDir) {
   const bbToken = resolveBitbucketToken(stored);
   const identity = stored.identity || {};
   const hasCachedIdentity = !!(identity.jiraAccountId && identity.bbUuid);
+  const settings = normalizeSettings(stored.settings);
 
   if (!bbToken) {
     // A once-validated session (cached identity) should never be thrown back
@@ -243,10 +324,11 @@ async function loadConfig(userDataDir) {
         jira: { baseUrl: stored.jira.baseUrl, email: stored.jira.email, token: stored.jira.token, myAccountId: identity.jiraAccountId },
         bitbucket: { workspace: stored.bitbucket.workspace, repos: stored.bitbucket.repos.slice(), token: null, myUuid: identity.bbUuid },
         ticketsDir: stored.ticketsDir || null,
-        pollIntervalMs: Number(stored.pollIntervalMs) || DEFAULTS.pollIntervalMs,
-        ignoreAuthors: Array.isArray(stored.ignoreAuthors) ? stored.ignoreAuthors : DEFAULTS.ignoreAuthors.slice(),
+        pollIntervalMs: settings.pollIntervalMs,
+        ignoreAuthors: settings.ignoreAuthors,
         localRepos: Array.isArray(stored.localRepos) ? stored.localRepos : [],
         gitAuthor: stored.gitAuthor || gitConfigValue('user.name'),
+        settings,
       };
     }
     return { needsSetup: true, setupError: 'Token Bitbucket introuvable' };
@@ -283,11 +365,12 @@ async function loadConfig(userDataDir) {
       myUuid: resolvedIdentity.bbUuid,
     },
     ticketsDir: stored.ticketsDir || null,
-    pollIntervalMs: Number(stored.pollIntervalMs) || DEFAULTS.pollIntervalMs,
-    ignoreAuthors: Array.isArray(stored.ignoreAuthors) ? stored.ignoreAuthors : DEFAULTS.ignoreAuthors.slice(),
+    pollIntervalMs: settings.pollIntervalMs,
+    ignoreAuthors: settings.ignoreAuthors,
     localRepos: Array.isArray(stored.localRepos) ? stored.localRepos : [],
     gitAuthor: stored.gitAuthor || gitConfigValue('user.name'),
+    settings,
   };
 }
 
-module.exports = { loadConfig, saveSetup, DEFAULTS };
+module.exports = { loadConfig, saveSetup, saveSettings, DEFAULTS, POLL_CHOICES_MS };

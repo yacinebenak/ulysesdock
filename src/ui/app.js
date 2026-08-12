@@ -19,6 +19,8 @@
     setupSave: function () { return Promise.resolve({ ok: false }); },
     getBacklog: function () { return Promise.reject(new Error('bridge missing')); },
     assignToMe: function () { return Promise.reject(new Error('bridge missing')); },
+    getSettings: function () { return Promise.reject(new Error('bridge missing')); },
+    saveSettings: function () { return Promise.reject(new Error('bridge missing')); },
   }, window.workdock || {});
 
   // ---------- helpers ----------
@@ -116,7 +118,7 @@
   // in its own box strictly below it. Scroll position lives on .panel-scroll.
   const scrolls = {
     today: $('today-scroll'), prs: $('prs-scroll'), tickets: $('tickets-scroll'),
-    finder: $('finder-scroll'), notifs: $('notif-list'),
+    finder: $('finder-scroll'), notifs: $('notif-list'), settings: $('settings-scroll'),
   };
   const filterEls = { prs: $('prs-filters'), tickets: $('tickets-filters'), finder: $('finder-filters') };
 
@@ -141,6 +143,18 @@
   const assigning = new Set(); // keys with an in-flight assignToMe call
   const assigned = new Set(); // keys successfully assigned this session
   const assignErrors = new Map(); // key -> error message
+
+  // Settings cache: fetched once on first visit to the tab, like the finder's
+  // backlog cache above. Each control saves on change; per-field state below.
+  const settingsState = { data: null, loading: false, error: null, fetchedAt: 0 };
+  const settingsPending = new Set(); // field keys with an in-flight save
+  const settingsSavedFlash = new Set(); // field keys showing the fading "saved" tick
+  const settingsSavedTimers = new Map(); // field key -> fade timeout id
+  const settingsFieldErrors = new Map(); // field key -> last save error message
+  // Raw text overrides for the comma-separated fields, so the box keeps
+  // exactly what the user typed instead of a reformatted join. null = derive
+  // the displayed text from settingsState.data.
+  const settingsText = { ignoreAuthors: null, repos: null };
 
   // ---------- per-tab filters (persisted) ----------
 
@@ -1275,6 +1289,383 @@
     pick.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
   }
 
+  // ---------- Réglages (settings) ----------
+
+  function fetchSettings(force) {
+    if (settingsState.loading) return;
+    if (settingsState.data && !force) return;
+    settingsState.loading = true;
+    settingsState.error = null;
+    renderSettings();
+    Promise.resolve(wd.getSettings()).then(function (s) {
+      settingsState.loading = false;
+      settingsState.data = (s && typeof s === 'object') ? s : {};
+      settingsState.fetchedAt = Date.now();
+      renderSettings();
+    }).catch(function (e) {
+      settingsState.loading = false;
+      settingsState.error = errMsg(e);
+      renderSettings();
+    });
+  }
+
+  function getPath(obj, path) {
+    let cur = obj;
+    for (const p of path) {
+      if (cur === null || cur === undefined) return undefined;
+      cur = cur[p];
+    }
+    return cur;
+  }
+
+  function setPath(obj, path, value) {
+    let cur = obj;
+    for (let i = 0; i < path.length - 1; i++) {
+      const key = path[i];
+      if (typeof cur[key] !== 'object' || cur[key] === null) cur[key] = {};
+      cur = cur[key];
+    }
+    cur[path[path.length - 1]] = value;
+  }
+
+  function clearSavedTimer(key) {
+    const t = settingsSavedTimers.get(key);
+    if (t) clearTimeout(t);
+    settingsSavedTimers.delete(key);
+    settingsSavedFlash.delete(key);
+  }
+
+  function flashSaved(key) {
+    settingsSavedFlash.add(key);
+    const t = setTimeout(function () {
+      settingsSavedFlash.delete(key);
+      settingsSavedTimers.delete(key);
+      renderSettings();
+    }, 1000);
+    settingsSavedTimers.set(key, t);
+  }
+
+  function saveIndicator(key) {
+    if (settingsPending.has(key)) return el('span', 'set-ind set-ind-spin');
+    if (settingsSavedFlash.has(key)) return el('span', 'set-ind set-ind-ok', '✓');
+    return null;
+  }
+
+  // Generic save for a single scalar/boolean field living at `path` inside
+  // settingsState.data. Optimistically applies `newValue`, disables the
+  // control while in flight, and reverts on failure.
+  function saveField(key, path, newValue, payload) {
+    if (!settingsState.data) return;
+    const prev = getPath(settingsState.data, path);
+    setPath(settingsState.data, path, newValue);
+    settingsPending.add(key);
+    settingsFieldErrors.delete(key);
+    clearSavedTimer(key);
+    renderSettings();
+    Promise.resolve(wd.saveSettings(payload)).then(function (res) {
+      settingsPending.delete(key);
+      const r = (res && typeof res === 'object') ? res : {};
+      if (r.ok) {
+        if (r.settings && typeof r.settings === 'object') settingsState.data = r.settings;
+        flashSaved(key);
+      } else {
+        setPath(settingsState.data, path, prev);
+        settingsFieldErrors.set(key, r.error || 'Échec de la sauvegarde');
+      }
+      renderSettings();
+    }).catch(function (e) {
+      settingsPending.delete(key);
+      setPath(settingsState.data, path, prev);
+      settingsFieldErrors.set(key, errMsg(e));
+      renderSettings();
+    });
+  }
+
+  // Save for the comma-separated list fields (ignoreAuthors, repos). Keeps
+  // the raw typed text in settingsText while pending; `keepTextOnError`
+  // controls whether a failed save reverts the box (ignoreAuthors) or keeps
+  // the user's text so they can fix a typo in place (repos).
+  function saveListField(key, path, rawText, keepTextOnError) {
+    if (!settingsState.data) return;
+    const arr = String(rawText || '').split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    const prevValue = getPath(settingsState.data, path);
+    const prevText = settingsText[key];
+    setPath(settingsState.data, path, arr);
+    settingsText[key] = rawText;
+    settingsPending.add(key);
+    settingsFieldErrors.delete(key);
+    clearSavedTimer(key);
+    renderSettings();
+    const payload = {};
+    payload[path[0]] = arr;
+    Promise.resolve(wd.saveSettings(payload)).then(function (res) {
+      settingsPending.delete(key);
+      const r = (res && typeof res === 'object') ? res : {};
+      if (r.ok) {
+        if (r.settings && typeof r.settings === 'object') settingsState.data = r.settings;
+        else if (key === 'repos' && Array.isArray(r.repos)) settingsState.data.repos = r.repos;
+        settingsText[key] = null; // display derives from canonical data again
+        flashSaved(key);
+      } else {
+        setPath(settingsState.data, path, prevValue);
+        if (!keepTextOnError) settingsText[key] = prevText;
+        settingsFieldErrors.set(key, r.error || 'Échec de la sauvegarde');
+      }
+      renderSettings();
+    }).catch(function (e) {
+      settingsPending.delete(key);
+      setPath(settingsState.data, path, prevValue);
+      if (!keepTextOnError) settingsText[key] = prevText;
+      settingsFieldErrors.set(key, errMsg(e));
+      renderSettings();
+    });
+  }
+
+  function listFieldText(key, path) {
+    if (settingsText[key] !== null && settingsText[key] !== undefined) return settingsText[key];
+    const arr = getPath(settingsState.data, path);
+    return Array.isArray(arr) ? arr.join(', ') : '';
+  }
+
+  function setGroup() {
+    return el('div', 'set-group');
+  }
+
+  function setRowBase(labelText, subText) {
+    const row = el('div', 'set-row');
+    const left = el('div');
+    left.appendChild(el('div', 'sl', labelText));
+    if (subText) left.appendChild(el('div', 'sd', subText));
+    row.appendChild(left);
+    return row;
+  }
+
+  function appendFieldError(group, key) {
+    const err = settingsFieldErrors.get(key);
+    if (err) group.appendChild(el('div', 'error-line set-error', err));
+  }
+
+  function toggleRow(group, key, path, labelText, subText, checked, buildPayload) {
+    const row = setRowBase(labelText, subText);
+    const right = el('div', 'row tight set-right');
+    const ind = saveIndicator(key);
+    if (ind) right.appendChild(ind);
+    const pending = settingsPending.has(key);
+    const t = el('div', 'toggle' + (checked ? ' on' : '') + (pending ? ' disabled' : ''));
+    t.setAttribute('role', 'switch');
+    t.setAttribute('aria-checked', checked ? 'true' : 'false');
+    if (!pending) {
+      t.addEventListener('click', function () {
+        const next = !checked;
+        saveField(key, path, next, buildPayload(next));
+      });
+    }
+    right.appendChild(t);
+    row.appendChild(right);
+    group.appendChild(row);
+    appendFieldError(group, key);
+  }
+
+  function pollLabel(ms) {
+    const n = Number(ms) || 0;
+    if (n > 0 && n % 60000 === 0) return (n / 60000) + ' min';
+    return Math.round(n / 1000) + ' s';
+  }
+
+  function pollRow(group, data) {
+    const key = 'pollIntervalMs';
+    const choices = (Array.isArray(data.pollChoices) && data.pollChoices.length)
+      ? data.pollChoices
+      : [15000, 30000, 60000, 120000, 300000];
+    const current = Number(data.pollIntervalMs) || choices[0];
+    const row = setRowBase('Intervalle de synchronisation', null);
+    const right = el('div', 'row tight set-right');
+    const ind = saveIndicator(key);
+    if (ind) right.appendChild(ind);
+    const select = el('select', 'set-select');
+    select.disabled = settingsPending.has(key);
+    for (const ms of choices) {
+      const opt = el('option', null, pollLabel(ms));
+      opt.value = String(ms);
+      if (ms === current) opt.selected = true;
+      select.appendChild(opt);
+    }
+    select.addEventListener('change', function () {
+      const v = Number(select.value);
+      saveField(key, ['pollIntervalMs'], v, { pollIntervalMs: v });
+    });
+    right.appendChild(select);
+    row.appendChild(right);
+    group.appendChild(row);
+    appendFieldError(group, key);
+  }
+
+  function dockSideRow(group, data) {
+    const key = 'dockSide';
+    const current = data.dockSide === 'left' ? 'left' : 'right';
+    const pending = settingsPending.has(key);
+    const row = setRowBase("Côté d'ancrage", null);
+    const right = el('div', 'row tight set-right');
+    const ind = saveIndicator(key);
+    if (ind) right.appendChild(ind);
+    const seg = el('div', 'segmented set-seg-mini');
+    [['left', 'Gauche'], ['right', 'Droite']].forEach(function (pair) {
+      const btn = el('button', 'seg' + (pair[0] === current ? ' active' : ''));
+      btn.appendChild(el('span', null, pair[1]));
+      btn.disabled = pending;
+      btn.addEventListener('click', function () {
+        if (pair[0] === current) return;
+        saveField(key, ['dockSide'], pair[0], { dockSide: pair[0] });
+      });
+      seg.appendChild(btn);
+    });
+    right.appendChild(seg);
+    row.appendChild(right);
+    group.appendChild(row);
+    appendFieldError(group, key);
+  }
+
+  function textFieldRow(group, key, path, labelText, subText, currentText, keepTextOnError) {
+    const row = el('div', 'set-row set-row-col');
+    const head = el('div', 'row tight set-row-head');
+    const left = el('div');
+    left.appendChild(el('div', 'sl', labelText));
+    if (subText) left.appendChild(el('div', 'sd', subText));
+    head.appendChild(left);
+    head.appendChild(el('span', 'spacer'));
+    const ind = saveIndicator(key);
+    if (ind) head.appendChild(ind);
+    row.appendChild(head);
+
+    const input = el('input', 'set-input');
+    input.type = 'text';
+    input.value = currentText;
+    input.disabled = settingsPending.has(key);
+    input.addEventListener('change', function () {
+      saveListField(key, path, input.value, keepTextOnError);
+    });
+    row.appendChild(input);
+    group.appendChild(row);
+    appendFieldError(group, key);
+  }
+
+  function quietHoursRows(group, data) {
+    const qh = (data && data.quietHours) || { enabled: false, start: '', end: '' };
+    toggleRow(group, 'quietHours.enabled', ['quietHours', 'enabled'], 'Heures silencieuses',
+      'aucun toast pendant cette plage', !!qh.enabled, function (v) {
+        return { quietHours: Object.assign({}, qh, { enabled: v }) };
+      });
+    if (!qh.enabled) return;
+
+    const row = el('div', 'set-row set-row-col set-row-nested');
+    const wrap = el('div', 'row tight set-times');
+
+    const startKey = 'quietHours.start';
+    const startInput = el('input', 'set-input set-time');
+    startInput.type = 'time';
+    startInput.value = qh.start || '';
+    startInput.disabled = settingsPending.has(startKey);
+    startInput.addEventListener('change', function () {
+      saveField(startKey, ['quietHours', 'start'], startInput.value,
+        { quietHours: Object.assign({}, qh, { start: startInput.value }) });
+    });
+    wrap.appendChild(startInput);
+    wrap.appendChild(el('span', 'muted small', '→'));
+
+    const endKey = 'quietHours.end';
+    const endInput = el('input', 'set-input set-time');
+    endInput.type = 'time';
+    endInput.value = qh.end || '';
+    endInput.disabled = settingsPending.has(endKey);
+    endInput.addEventListener('change', function () {
+      saveField(endKey, ['quietHours', 'end'], endInput.value,
+        { quietHours: Object.assign({}, qh, { end: endInput.value }) });
+    });
+    wrap.appendChild(endInput);
+
+    const indStart = saveIndicator(startKey);
+    if (indStart) wrap.appendChild(indStart);
+    const indEnd = saveIndicator(endKey);
+    if (indEnd) wrap.appendChild(indEnd);
+
+    row.appendChild(wrap);
+    group.appendChild(row);
+    appendFieldError(group, startKey);
+    appendFieldError(group, endKey);
+  }
+
+  function notifyToggle(group, subKey, labelText, checked) {
+    const key = 'notifyTypes.' + subKey;
+    toggleRow(group, key, ['notifyTypes', subKey], labelText, null, checked, function (v) {
+      const nt = Object.assign({}, (settingsState.data && settingsState.data.notifyTypes) || {});
+      nt[subKey] = v;
+      return { notifyTypes: nt };
+    });
+  }
+
+  function renderSettings() {
+    const scroll = scrolls.settings;
+    const st = scroll.scrollTop || 0;
+    scroll.textContent = '';
+
+    if (settingsState.loading && !settingsState.data) {
+      scroll.appendChild(el('div', 'muted small', 'Loading…'));
+      return;
+    }
+    if (settingsState.error && !settingsState.data) {
+      scroll.appendChild(el('div', 'error-line', settingsState.error));
+      const retry = el('button', 'link-btn', 'Retry');
+      retry.addEventListener('click', function () { fetchSettings(true); });
+      scroll.appendChild(retry);
+      return;
+    }
+
+    const data = settingsState.data || {};
+    const nt = data.notifyTypes || {};
+
+    scroll.appendChild(el('div', 'seclabel', 'Général'));
+    const g1 = setGroup();
+    toggleRow(g1, 'startAtLogin', ['startAtLogin'], 'Lancer au démarrage de Windows', null,
+      !!data.startAtLogin, function (v) { return { startAtLogin: v }; });
+    toggleRow(g1, 'startHidden', ['startHidden'], 'Démarrer masqué', 'au prochain lancement',
+      !!data.startHidden, function (v) { return { startHidden: v }; });
+    dockSideRow(g1, data);
+    scroll.appendChild(g1);
+
+    scroll.appendChild(el('div', 'seclabel', 'Synchronisation'));
+    const g2 = setGroup();
+    pollRow(g2, data);
+    textFieldRow(g2, 'ignoreAuthors', ['ignoreAuthors'], 'Bots ignorés', 'ex. UlysesSuite, CloudPMS',
+      listFieldText('ignoreAuthors', ['ignoreAuthors']), false);
+    textFieldRow(g2, 'repos', ['repos'], 'Dépôts Bitbucket surveillés', 'ex. backend, frontend',
+      listFieldText('repos', ['repos']), true);
+    quietHoursRows(g2, data);
+    scroll.appendChild(g2);
+
+    scroll.appendChild(el('div', 'seclabel', 'Notifications'));
+    const g3 = setGroup();
+    notifyToggle(g3, 'comment', 'Commentaires Jira', !!nt.comment);
+    notifyToggle(g3, 'status', 'Changements de statut', !!nt.status);
+    notifyToggle(g3, 'assign', 'Assignations', !!nt.assign);
+    notifyToggle(g3, 'prActivity', 'Activité sur mes PRs', !!nt.prActivity);
+    toggleRow(g3, 'toastsEnabled', ['toastsEnabled'], 'Toasts Windows',
+      'notifications système au lancement d’un nouvel événement', !!data.toastsEnabled,
+      function (v) { return { toastsEnabled: v }; });
+    scroll.appendChild(g3);
+
+    scroll.appendChild(el('div', 'seclabel', 'Raccourcis'));
+    const g4 = setGroup();
+    const shortcutRow = setRowBase('Afficher / masquer', null);
+    const kbds = el('div', 'row tight');
+    kbds.appendChild(el('span', 'kbd', 'Alt+K'));
+    kbds.appendChild(el('span', 'kbd', 'Ctrl+Alt+P'));
+    shortcutRow.appendChild(kbds);
+    g4.appendChild(shortcutRow);
+    scroll.appendChild(g4);
+
+    scroll.scrollTop = st;
+  }
+
   const RENDER = { today: renderToday, prs: renderPRs, tickets: renderTickets, notifs: renderNotifs };
 
   // ---------- snapshot handling ----------
@@ -1364,6 +1755,7 @@
     }
     if (name === 'today' && !standup.fetchedAt && !standup.loading) fetchStandup();
     if (name === 'finder' && !backlog.data && !backlog.loading) fetchBacklog();
+    if (name === 'settings' && !settingsState.data && !settingsState.loading) fetchSettings();
   }
 
   for (const name of Object.keys(tabs)) {

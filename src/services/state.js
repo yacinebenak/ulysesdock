@@ -6,7 +6,7 @@ const path = require('path');
 const STATE_FILE = 'state.json';
 
 function defaultState() {
-  return { lastPollIso: null, dismissed: [], notifications: [], collapsed: false };
+  return { lastPollIso: null, dismissed: [], notifications: [], collapsed: false, watchedKeys: [] };
 }
 
 /**
@@ -23,6 +23,7 @@ function loadState(dir) {
     if (typeof state.lastPollIso !== 'string') state.lastPollIso = null;
     if (!Array.isArray(state.dismissed)) state.dismissed = [];
     if (!Array.isArray(state.notifications)) state.notifications = [];
+    if (!Array.isArray(state.watchedKeys)) state.watchedKeys = [];
     return state;
   } catch (_) {
     return def;
