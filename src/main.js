@@ -278,9 +278,25 @@ app.whenReady().then(async () => {
 
   createWindow();
   createTray();
-  if (!globalShortcut.register('Alt+K', toggleVisible)) {
-    console.error('Alt+K global shortcut could not be registered (already in use?)');
+  for (const accel of ['Alt+K', 'Ctrl+Alt+P']) {
+    if (!globalShortcut.register(accel, toggleVisible)) {
+      console.error(accel + ' global shortcut could not be registered (already in use?)');
+    }
   }
+
+  // Start with Windows. Packaged builds register their own exe; when running
+  // from source, register electron.exe with the app directory as argument.
+  try {
+    const loginSettings = { openAtLogin: true };
+    if (!app.isPackaged) {
+      loginSettings.path = process.execPath;
+      loginSettings.args = [path.resolve(__dirname, '..')];
+    }
+    app.setLoginItemSettings(loginSettings);
+  } catch (e) {
+    console.error('Could not register login item:', e.message);
+  }
+
   if (!cfg.needsSetup) startPolling();
 });
 
