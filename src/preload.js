@@ -18,4 +18,6 @@ contextBridge.exposeInMainWorld('workdock', {
   getStandup: () => ipcRenderer.invoke('standup:get'),
   copyText: (text) => ipcRenderer.invoke('clipboard:copy', text),
   setupSave: (payload) => ipcRenderer.invoke('setup:save', payload),
+  getBacklog: () => ipcRenderer.invoke('backlog:get'),
+  assignToMe: (key) => ipcRenderer.invoke('backlog:assign', key),
 });

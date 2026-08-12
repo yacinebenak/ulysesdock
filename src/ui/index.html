@@ -10,48 +10,84 @@
 
   <!-- Collapsed 36px rail -->
   <aside id="rail">
-    <button id="expand-btn" class="icon-btn" title="Expand panel">&lt;=</button>
-    <span id="rail-badge" class="badge"></span>
+    <button id="expand-btn" class="icon-btn" title="Expand panel">
+      <svg viewBox="0 0 24 24" class="rail-icon"><path d="M9 5l7 7-7 7"/></svg>
+    </button>
+    <span id="rail-badge" class="badge nbadge-static"></span>
     <div id="rail-title">UlysesDock</div>
   </aside>
 
   <!-- Expanded 400px panel -->
   <div id="panel">
-    <header id="topbar">
+    <header id="topbar" title="Clic droit : replier">
+      <div class="logo"></div>
       <span id="app-title">UlysesDock</span>
       <span id="sync-label" class="muted small">sync &#8212;</span>
       <span class="spacer"></span>
       <button id="refresh-btn" class="icon-btn" title="Refresh now">&#10227;</button>
-      <button id="collapse-btn" class="icon-btn" title="Collapse to rail">=&gt;</button>
+      <button id="collapse-btn" class="icon-btn" title="Collapse to rail">&#8658;</button>
       <button id="quit-btn" class="icon-btn quit" title="Masquer dans la zone de notification (quitter : clic droit sur l'ic&#244;ne tray)">&#10005;</button>
     </header>
 
-    <nav id="tabstrip">
-      <button id="tab-today" class="tab active">Récap</button>
-      <button id="tab-prs" class="tab">PRs</button>
-      <button id="tab-tickets" class="tab">Tickets</button>
-      <button id="tab-notifs" class="tab">Notifs&nbsp;<span id="tab-badge" class="badge"></span></button>
-    </nav>
+    <div id="body-layout">
+      <nav id="railnav">
+        <button id="tab-today" class="tab active" data-tab="today" title="Accueil" aria-label="Accueil">
+          <svg viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v8.4a1 1 0 0 1-1 1h-4.6V15h-4.8v5.4H5a1 1 0 0 1-1-1z"/></svg>
+        </button>
+        <button id="tab-prs" class="tab" data-tab="prs" title="Pull requests" aria-label="Pull requests">
+          <svg viewBox="0 0 24 24"><circle cx="6.5" cy="6" r="2.3"/><circle cx="6.5" cy="18" r="2.3"/><circle cx="17.5" cy="18" r="2.3"/><path d="M6.5 8.3v7.4M13 6h1.5a3 3 0 0 1 3 3v6.7"/><path d="M15.2 4l-2.4 2 2.4 2"/></svg>
+        </button>
+        <button id="tab-tickets" class="tab" data-tab="tickets" title="Tickets" aria-label="Tickets">
+          <svg viewBox="0 0 24 24"><path d="M4 9a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v1.2a1.8 1.8 0 0 0 0 3.6V15a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-1.2a1.8 1.8 0 0 0 0-3.6z"/><path d="M13.5 7v2M13.5 11v2M13.5 15v2"/></svg>
+        </button>
+        <button id="tab-finder" class="tab" data-tab="finder" title="Trouver un ticket" aria-label="Trouver un ticket">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>
+        </button>
+        <button id="tab-notifs" class="tab" data-tab="notifs" title="Notifications" aria-label="Notifications">
+          <svg viewBox="0 0 24 24"><path d="M18 16v-5.2A6 6 0 0 0 6 10.8V16l-1.6 2.2h15.2z"/><path d="M10.4 20.5a1.8 1.8 0 0 0 3.2 0"/></svg>
+          <span id="tab-badge" class="badge nbadge"></span>
+        </button>
+        <div class="spacer"></div>
+        <button id="tab-settings" class="tab" data-tab="settings" title="Réglages" aria-label="Réglages">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6L18 18M18 6l-1.4 1.4M7.4 16.6L6 18"/></svg>
+        </button>
+      </nav>
 
-    <main id="content">
-      <section id="panel-today" class="panel active">
-        <div id="today-scroll" class="panel-scroll"></div>
-      </section>
-      <section id="panel-prs" class="panel">
-        <div id="prs-filters" class="filter-bar hidden"></div>
-        <div id="prs-scroll" class="panel-scroll"></div>
-      </section>
-      <section id="panel-tickets" class="panel">
-        <div id="tickets-filters" class="filter-bar hidden"></div>
-        <div id="tickets-scroll" class="panel-scroll"></div>
-      </section>
-      <section id="panel-notifs" class="panel">
-        <div id="notif-tools" class="filter-bar panel-tools hidden">
-          <button id="clear-all" class="link-btn">Clear all</button>
-        </div>
-        <div id="notif-list" class="panel-scroll"></div>
-      </section>
-    </main>
+      <main id="content">
+        <section id="panel-today" class="panel active">
+          <div id="today-scroll" class="panel-scroll"></div>
+        </section>
+        <section id="panel-prs" class="panel">
+          <div id="prs-filters" class="filter-bar hidden"></div>
+          <div id="prs-scroll" class="panel-scroll"></div>
+        </section>
+        <section id="panel-tickets" class="panel">
+          <div id="tickets-filters" class="filter-bar hidden"></div>
+          <div id="tickets-scroll" class="panel-scroll"></div>
+        </section>
+        <section id="panel-finder" class="panel">
+          <div id="finder-filters" class="filter-bar hidden"></div>
+          <div id="finder-scroll" class="panel-scroll"></div>
+        </section>
+        <section id="panel-notifs" class="panel">
+          <div id="notif-tools" class="filter-bar panel-tools hidden">
+            <button id="clear-all" class="link-btn">Tout effacer</button>
+          </div>
+          <div id="notif-list" class="panel-scroll"></div>
+        </section>
+        <section id="panel-settings" class="panel">
+          <div class="panel-scroll">
+            <div class="settings-soon">
+              <div class="settings-soon-icon">
+                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3.5v2M12 18.5v2M3.5 12h2M18.5 12h2M6 6l1.4 1.4M16.6 16.6L18 18M18 6l-1.4 1.4M7.4 16.6L6 18"/></svg>
+              </div>
+              <div class="settings-soon-title">Réglages</div>
+              <p class="settings-soon-sub">Bientôt disponible &mdash; démarrage, raccourcis, intervalle de synchronisation et types de notifications se régleront directement ici.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
 
     <div id="setup"></div>
 

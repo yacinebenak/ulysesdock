@@ -37,7 +37,7 @@ function writeJson(file, obj) {
   fs.renameSync(tmp, file);
 }
 
-function gitCredentialFill(host) {
+function gitCredentialFillOnce(host) {
   const res = spawnSync('git', ['credential', 'fill'], {
     input: `protocol=https\nhost=${host}\n\n`,
     encoding: 'utf8',
@@ -54,6 +54,13 @@ function gitCredentialFill(host) {
     if (i > 0) out[line.slice(0, i)] = line.slice(i + 1);
   }
   return out.password ? out : null;
+}
+
+function gitCredentialFill(host) {
+  // spawnSync against the credential manager occasionally fails transiently
+  // (process contention when the app restarts quickly, a momentarily locked
+  // credential store) — one retry avoids treating that as "no credential".
+  return gitCredentialFillOnce(host) || gitCredentialFillOnce(host);
 }
 
 function gitConfigValue(key) {
@@ -223,10 +230,30 @@ async function loadConfig(userDataDir) {
   }
 
   const bbToken = resolveBitbucketToken(stored);
-  if (!bbToken) return { needsSetup: true, setupError: 'Token Bitbucket introuvable' };
+  const identity = stored.identity || {};
+  const hasCachedIdentity = !!(identity.jiraAccountId && identity.bbUuid);
 
-  let identity = stored.identity || {};
-  if (!identity.jiraAccountId || !identity.bbUuid) {
+  if (!bbToken) {
+    // A once-validated session (cached identity) should never be thrown back
+    // to the setup screen over a transient Bitbucket credential hiccup — that
+    // reads as "it logged me out" when Jira is perfectly fine. Keep the app
+    // usable; bitbucket.js calls will surface their own error in the strip.
+    if (hasCachedIdentity) {
+      return {
+        jira: { baseUrl: stored.jira.baseUrl, email: stored.jira.email, token: stored.jira.token, myAccountId: identity.jiraAccountId },
+        bitbucket: { workspace: stored.bitbucket.workspace, repos: stored.bitbucket.repos.slice(), token: null, myUuid: identity.bbUuid },
+        ticketsDir: stored.ticketsDir || null,
+        pollIntervalMs: Number(stored.pollIntervalMs) || DEFAULTS.pollIntervalMs,
+        ignoreAuthors: Array.isArray(stored.ignoreAuthors) ? stored.ignoreAuthors : DEFAULTS.ignoreAuthors.slice(),
+        localRepos: Array.isArray(stored.localRepos) ? stored.localRepos : [],
+        gitAuthor: stored.gitAuthor || gitConfigValue('user.name'),
+      };
+    }
+    return { needsSetup: true, setupError: 'Token Bitbucket introuvable' };
+  }
+
+  let resolvedIdentity = identity;
+  if (!hasCachedIdentity) {
     const [jira, bb] = await Promise.all([
       testJira(stored.jira.baseUrl, stored.jira.email, stored.jira.token),
       testBitbucket(bbToken, stored.bitbucket.workspace, stored.bitbucket.repos[0]),
@@ -238,23 +265,22 @@ async function loadConfig(userDataDir) {
           .filter(Boolean).join(' — '),
       };
     }
-    identity = { jiraAccountId: jira.accountId, bbUuid: bb.uuid, displayName: bb.displayName };
-    stored.identity = identity;
+    resolvedIdentity = { jiraAccountId: jira.accountId, bbUuid: bb.uuid, displayName: bb.displayName };
+    stored.identity = resolvedIdentity;
     writeJson(configPath(userDataDir), stored);
   }
-
   return {
     jira: {
       baseUrl: stored.jira.baseUrl,
       email: stored.jira.email,
       token: stored.jira.token,
-      myAccountId: identity.jiraAccountId,
+      myAccountId: resolvedIdentity.jiraAccountId,
     },
     bitbucket: {
       workspace: stored.bitbucket.workspace,
       repos: stored.bitbucket.repos.slice(),
       token: bbToken,
-      myUuid: identity.bbUuid,
+      myUuid: resolvedIdentity.bbUuid,
     },
     ticketsDir: stored.ticketsDir || null,
     pollIntervalMs: Number(stored.pollIntervalMs) || DEFAULTS.pollIntervalMs,

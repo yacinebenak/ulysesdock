@@ -142,7 +142,7 @@ function createWindow() {
     resizable: false,
     show: false,
     skipTaskbar: true,
-    alwaysOnTop: false,
+    alwaysOnTop: true,
     title: 'UlysesDock',
     backgroundColor: '#1b1e24',
     webPreferences: {
@@ -151,6 +151,11 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+  // 'screen-saver' is the highest z-order level Electron exposes — it keeps
+  // the dock visible over other apps' fullscreen windows (video, Teams calls,
+  // full-screen browser), not just above normal, unfocused windows.
+  win.setAlwaysOnTop(true, 'screen-saver');
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   applyBounds();
   win.loadFile(path.join(__dirname, 'ui', 'index.html'));
   win.once('ready-to-show', () => {
@@ -260,6 +265,15 @@ app.whenReady().then(async () => {
     const body = String(text || '').trim();
     if (!body) throw new Error('Empty comment');
     await jira.postComment(cfg, String(key), body);
+    return true;
+  });
+  ipcMain.handle('backlog:get', () =>
+    cfg && !cfg.needsSetup ? jira.fetchBacklogTickets(cfg) : []
+  );
+  ipcMain.handle('backlog:assign', async (_e, key) => {
+    if (!cfg || cfg.needsSetup) throw new Error('Configuration incomplète');
+    if (!/^[A-Z][A-Z0-9]+-\d+$/.test(String(key))) throw new Error('Invalid ticket key');
+    await jira.assignToMe(cfg, String(key));
     return true;
   });
   ipcMain.handle('standup:get', () =>

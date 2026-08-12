@@ -17,6 +17,8 @@
     getStandup: function () { return Promise.resolve({ sinceIso: null, sinceLabel: 'hier', commits: [] }); },
     copyText: noop,
     setupSave: function () { return Promise.resolve({ ok: false }); },
+    getBacklog: function () { return Promise.reject(new Error('bridge missing')); },
+    assignToMe: function () { return Promise.reject(new Error('bridge missing')); },
   }, window.workdock || {});
 
   // ---------- helpers ----------
@@ -57,6 +59,15 @@
     return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   }
 
+  function daysAgoLabel(iso) {
+    const t = parseTs(iso);
+    if (t === null) return '';
+    const days = Math.floor((Date.now() - t) / 86400000);
+    if (days <= 0) return "libre depuis aujourd'hui";
+    if (days === 1) return 'libre depuis 1 j';
+    return 'libre depuis ' + days + ' j';
+  }
+
   function relTimeEl(iso) {
     const node = el('span', 'reltime', relTime(iso));
     node.dataset.ts = iso || '';
@@ -80,6 +91,7 @@
   // ---------- element refs ----------
 
   const body = document.body;
+  const topbar = $('topbar');
   const syncLabel = $('sync-label');
   const refreshBtn = $('refresh-btn');
   const collapseBtn = $('collapse-btn');
@@ -92,12 +104,21 @@
   const tabBadge = $('tab-badge');
   const railBadge = $('rail-badge');
 
-  const tabs = { today: $('tab-today'), prs: $('tab-prs'), tickets: $('tab-tickets'), notifs: $('tab-notifs') };
-  const panels = { today: $('panel-today'), prs: $('panel-prs'), tickets: $('panel-tickets'), notifs: $('panel-notifs') };
+  const tabs = {
+    today: $('tab-today'), prs: $('tab-prs'), tickets: $('tab-tickets'),
+    finder: $('tab-finder'), notifs: $('tab-notifs'), settings: $('tab-settings'),
+  };
+  const panels = {
+    today: $('panel-today'), prs: $('panel-prs'), tickets: $('panel-tickets'),
+    finder: $('panel-finder'), notifs: $('panel-notifs'), settings: $('panel-settings'),
+  };
   // Static per-panel children: the filter bar never scrolls; the list scrolls
   // in its own box strictly below it. Scroll position lives on .panel-scroll.
-  const scrolls = { today: $('today-scroll'), prs: $('prs-scroll'), tickets: $('tickets-scroll'), notifs: $('notif-list') };
-  const filterEls = { prs: $('prs-filters'), tickets: $('tickets-filters') };
+  const scrolls = {
+    today: $('today-scroll'), prs: $('prs-scroll'), tickets: $('tickets-scroll'),
+    finder: $('finder-scroll'), notifs: $('notif-list'),
+  };
+  const filterEls = { prs: $('prs-filters'), tickets: $('tickets-filters'), finder: $('finder-filters') };
 
   // ---------- state ----------
 
@@ -112,6 +133,14 @@
   // Standup cache: refreshed on snapshot pushes at most once per 5 minutes.
   const STANDUP_TTL = 5 * 60 * 1000;
   const standup = { data: null, fetchedAt: 0, loading: false, error: null };
+
+  // Backlog finder cache: fetched once on first visit to the tab, not on
+  // every poll — the user explicitly refreshes by leaving/re-entering never
+  // triggers a re-fetch (see fetchBacklog's `force` guard).
+  const backlog = { data: null, loading: false, error: null, fetchedAt: 0 };
+  const assigning = new Set(); // keys with an in-flight assignToMe call
+  const assigned = new Set(); // keys successfully assigned this session
+  const assignErrors = new Map(); // key -> error message
 
   // ---------- per-tab filters (persisted) ----------
 
@@ -149,15 +178,37 @@
     { id: 'all', label: 'All', test: function () { return true; } },
   ];
 
+  const FINDER_FILTERS = [
+    { id: 'all', label: 'Tous', test: function () { return true; } },
+    { id: 'easy', label: 'Facile', test: function (t) { return String(t && t.difficulty) === 'easy'; } },
+    { id: 'medium', label: 'Moyen', test: function (t) { return String(t && t.difficulty) === 'medium'; } },
+    { id: 'hard', label: 'Costaud', test: function (t) { return String(t && t.difficulty) === 'hard'; } },
+  ];
+
+  // Category: a specific project's backlog, or Bugs (any project).
+  const FINDER_CATEGORIES = [
+    { id: 'all', label: 'Tous', test: function () { return true; } },
+    { id: 'b2', label: 'B2', test: function (t) { return String(t && t.project) === 'B2'; } },
+    { id: 'pmsweb', label: 'PMSWEB', test: function (t) { return String(t && t.project) === 'PMSWEB'; } },
+    { id: 'bugs', label: 'Bugs', test: function (t) { return String(t && t.type) === 'Bug'; } },
+  ];
+
   const filters = {
     prs: store.get('workdock.filter.prs', 'open'),
     tickets: store.get('workdock.filter.tickets', 'all'),
     ticketsProject: store.get('workdock.filter.ticketsProject', 'all'),
+    finder: store.get('workdock.filter.finder', 'all'),
+    finderCategory: store.get('workdock.filter.finderCategory', 'all'),
   };
   if (!PR_FILTERS.some(function (f) { return f.id === filters.prs; })) filters.prs = 'open';
+  if (!FINDER_FILTERS.some(function (f) { return f.id === filters.finder; })) filters.finder = 'all';
+  if (!FINDER_CATEGORIES.some(function (f) { return f.id === filters.finderCategory; })) filters.finderCategory = 'all';
 
   // Which tab a filter belongs to (ticketsProject drives the tickets panel).
-  const FILTER_TAB = { prs: 'prs', tickets: 'tickets', ticketsProject: 'tickets' };
+  const FILTER_TAB = {
+    prs: 'prs', tickets: 'tickets', ticketsProject: 'tickets',
+    finder: 'finder', finderCategory: 'finder',
+  };
 
   function safeFilter(list, test) {
     return list.filter(function (item) {
@@ -180,6 +231,7 @@
   function setFilter(name, id) {
     filters[name] = id;
     store.set('workdock.filter.' + name, id);
+    if (name === 'finder' || name === 'finderCategory') { renderFinder(); return; } // backlog isn't snapshot-driven, no fingerprint needed
     const tab = FILTER_TAB[name] || name;
     fingerprints[tab] = tabFingerprint(tab);
     RENDER[tab]();
@@ -189,6 +241,10 @@
 
   function repoChipClass(repo) {
     return repo === 'backend' ? 'repo-backend' : (repo === 'frontend' ? 'repo-frontend' : 'repo-other');
+  }
+
+  function repoTagClass(repo) {
+    return repo === 'backend' ? 'repo-b' : (repo === 'frontend' ? 'repo-f' : 'repo-o');
   }
 
   function reviewBadge(pr) {
@@ -695,8 +751,34 @@
     });
   }
 
-  function recentNotifs() {
-    return (Array.isArray(snap.notifications) ? snap.notifications : []).slice(0, 5);
+  function regressionNotifs() {
+    return (Array.isArray(snap.notifications) ? snap.notifications : []).filter(function (n) {
+      return !!(n && n.regression);
+    });
+  }
+
+  // Merges "PRs à répondre" and QA-return notifications into one time-sorted
+  // queue for the Accueil "À traiter" section.
+  function traiterItems() {
+    const items = [];
+    for (const pr of awaitingPRs()) {
+      const ts = parseTs(pr && pr.lastHumanComment && pr.lastHumanComment.date) || parseTs(pr && pr.created) || 0;
+      items.push({ ts: ts, kind: 'pr', data: pr });
+    }
+    for (const n of regressionNotifs()) {
+      items.push({ ts: parseTs(n && n.date) || 0, kind: 'notif', data: n });
+    }
+    items.sort(function (a, b) { return b.ts - a.ts; });
+    return items;
+  }
+
+  function displayNameOf() {
+    const id = snap && (snap.displayName || (snap.identity && snap.identity.displayName));
+    return id ? String(id).split(' ')[0] : null;
+  }
+
+  function frenchDate() {
+    return new Date().toLocaleDateString('fr-FR', { weekday: 'long', day: 'numeric', month: 'long' });
   }
 
   function commitGroups(data) {
@@ -765,102 +847,140 @@
     return node;
   }
 
+  function traiterCard(item) {
+    const card = el('div', 'card queue-card');
+    const qi = el('div', 'queue-item');
+    qi.appendChild(el('span', 'dot red'));
+    const txt = el('div', 'txt');
+
+    if (item.kind === 'pr') {
+      const pr = item.data;
+      txt.appendChild(el('div', 't1 clamp1', (pr && pr.title) || '(untitled PR)'));
+      const t2 = el('div', 't2');
+      const repo = (pr && pr.repo) || '';
+      if (repo) t2.appendChild(el('span', 'tag ' + repoTagClass(repo), repo));
+      const lhc = pr && pr.lastHumanComment;
+      if (lhc) {
+        t2.appendChild(el('span', null, (lhc.author || '?') + ' · '));
+        t2.appendChild(relTimeEl(lhc.date));
+      }
+      txt.appendChild(t2);
+      qi.appendChild(txt);
+      card.classList.add('openable');
+      card.addEventListener('click', function () { if (pr && pr.url) wd.openExternal(pr.url); });
+    } else {
+      const n = item.data;
+      txt.appendChild(el('div', 't1 clamp1', (n && (n.title || n.key)) || '(notification)'));
+      const t2 = el('div', 't2');
+      t2.appendChild(el('span', 'tag retour', 'RETOUR QA'));
+      t2.appendChild(el('span', null, ((n && n.author) || '') + ' · '));
+      t2.appendChild(relTimeEl(n && n.date));
+      txt.appendChild(t2);
+      qi.appendChild(txt);
+      if (n && n.key) {
+        card.classList.add('openable');
+        card.addEventListener('click', function () { openDrawer(n.key); });
+      }
+    }
+
+    card.appendChild(qi);
+    return card;
+  }
+
   function renderToday() {
     const panel = scrolls.today;
     const st = panel.scrollTop || 0;
     panel.textContent = '';
 
-    // -- PRs à traiter --
-    const phead = el('div', 'section-head');
-    phead.appendChild(el('span', 'section-title', 'PRs à traiter'));
-    panel.appendChild(phead);
+    // -- Salut {name} --
+    const hello = el('div', 'hello');
+    hello.appendChild(el('div', 'date', frenchDate()));
+    const name = displayNameOf();
+    hello.appendChild(el('div', 'hi', name ? ('Salut ' + name + ' 👋') : 'Salut 👋'));
+    panel.appendChild(hello);
+
+    // -- 3 stat tiles --
     const awaiting = awaitingPRs();
-    if (!awaiting.length) {
-      panel.appendChild(el('div', 'muted small', "Aucune PR n'attend ta réponse ✨"));
-    }
-    for (const pr of awaiting) {
-      const row = el('div', 'pr-review-row');
-      row.appendChild(el('span', 'dot dot-danger'));
-      const title = el('span', 'pr-review-title', (pr && pr.title) || '(untitled PR)');
-      makeLink(title, pr && pr.url, (pr && pr.title) || '');
-      row.appendChild(title);
-      const repo = (pr && pr.repo) || '';
-      row.appendChild(el('span', 'chip ' + repoChipClass(repo), repo || 'repo'));
-      const lhc = pr && pr.lastHumanComment;
-      if (lhc) {
-        const meta = el('span', 'pr-review-meta');
-        meta.appendChild(el('span', null, '💬 ' + (lhc.author || '?') + ' · '));
-        meta.appendChild(relTimeEl(lhc.date));
-        row.appendChild(meta);
-      }
-      panel.appendChild(row);
+    const current = enCoursTickets();
+    const unread = Number(snap.unread) || 0;
+    const tiles = el('div', 'tiles');
+    const prTile = el('div', 'tile alert');
+    prTile.appendChild(el('div', 'n', awaiting.length));
+    prTile.appendChild(el('div', 'l', awaiting.length === 1 ? 'PR à répondre' : 'PRs à répondre'));
+    prTile.addEventListener('click', function () { setTab('prs'); });
+    tiles.appendChild(prTile);
+    const ticketTile = el('div', 'tile work');
+    ticketTile.appendChild(el('div', 'n', current.length));
+    ticketTile.appendChild(el('div', 'l', current.length === 1 ? 'ticket en cours' : 'tickets en cours'));
+    ticketTile.addEventListener('click', function () { setTab('tickets'); });
+    tiles.appendChild(ticketTile);
+    const notifTile = el('div', 'tile info');
+    notifTile.appendChild(el('div', 'n', unread));
+    notifTile.appendChild(el('div', 'l', unread === 1 ? 'notification' : 'notifications'));
+    notifTile.addEventListener('click', function () { setTab('notifs'); });
+    tiles.appendChild(notifTile);
+    panel.appendChild(tiles);
+
+    // -- À traiter (PRs à répondre + retours QA) --
+    panel.appendChild(el('div', 'seclabel', 'À traiter'));
+    const items = traiterItems();
+    if (!items.length) {
+      panel.appendChild(el('div', 'muted small', 'Rien à traiter ✨'));
+    } else {
+      for (const item of items) panel.appendChild(traiterCard(item));
     }
 
-    // -- Mon récap --
-    const head = el('div', 'section-head');
-    head.appendChild(el('span', 'section-title', 'Mon récap'));
-    head.appendChild(el('span', 'spacer'));
-    const copyBtn = el('button', 'link-btn copy-btn', 'Copier');
+    // -- Standup (condensed) --
+    panel.appendChild(el('div', 'seclabel', 'Standup'));
+    const box = el('div', 'standup');
+    const data = standup.data;
+    const row = el('div', 'row');
+    row.appendChild(el('span', 'row-title', ((data && data.sinceLabel) || 'Hier') + ' — mes commits'));
+    row.appendChild(el('span', 'spacer'));
+    const copyBtn = el('button', 'copybtn', 'Copier');
     copyBtn.addEventListener('click', function () {
       wd.copyText(standupText());
       copyBtn.textContent = 'Copié ✓';
       setTimeout(function () { copyBtn.textContent = 'Copier'; }, 1500);
     });
-    head.appendChild(copyBtn);
-    panel.appendChild(head);
-    panel.appendChild(el('div', 'section-sub', "Tes commits d'hier et tes tickets en cours — le bouton Copier te fait le message pour le daily."));
+    row.appendChild(copyBtn);
+    box.appendChild(row);
 
-    const data = standup.data;
-    panel.appendChild(el('div', 'group-header', ((data && data.sinceLabel) || 'Hier') + ' — mes commits'));
     if (standup.loading && !data) {
-      panel.appendChild(el('div', 'muted small', 'Loading…'));
+      box.appendChild(el('div', 'muted small', 'Loading…'));
     } else if (standup.error && !data) {
-      panel.appendChild(el('div', 'error-line', standup.error));
+      box.appendChild(el('div', 'error-line', standup.error));
       const retry = el('button', 'link-btn', 'Retry');
       retry.addEventListener('click', fetchStandup);
-      panel.appendChild(retry);
+      box.appendChild(retry);
     } else {
       const groups = commitGroups(data);
-      if (!groups.length) panel.appendChild(el('div', 'muted small', 'Aucun commit'));
+      if (!groups.length) {
+        box.appendChild(el('div', 'muted small', 'Aucun commit'));
+      }
       for (const g of groups) {
-        const wrap = el('div', 'standup-ticket');
-        wrap.appendChild(g.key ? todayKeyLink(g.key) : el('span', 'ticket-key mono muted', 'divers'));
-        for (const c of g.commits) {
-          const line = el('div', 'commit-line', ((c && c.repo) || '?') + ' · ' + ((c && c.subject) || ''));
-          line.title = ((c && c.repo) || '?') + ' · ' + ((c && c.subject) || '');
-          wrap.appendChild(line);
-        }
-        panel.appendChild(wrap);
+        const line = el('div', 'line');
+        line.appendChild(g.key ? todayKeyLink(g.key) : el('span', 'ticket-key mono muted', 'divers'));
+        const first = g.commits[0] || {};
+        const sub = el('span', 'sub', (first.subject || '') + (g.commits.length > 1 ? ' …' : ''));
+        sub.title = g.commits.map(function (c) { return (c && c.subject) || ''; }).join('\n');
+        line.appendChild(sub);
+        line.appendChild(el('span', 'mono muted small', (first.repo || '?') + ' ×' + g.commits.length));
+        box.appendChild(line);
+      }
+    }
+    panel.appendChild(box);
+
+    if (current.length) {
+      panel.appendChild(el('div', 'seclabel', "Aujourd'hui — en cours"));
+      for (const t of current) {
+        const line = el('div', 'today-ticket-line');
+        line.appendChild(todayKeyLink(t && t.key));
+        line.appendChild(el('span', 'today-summary', (t && t.summary) || ''));
+        panel.appendChild(line);
       }
     }
 
-    panel.appendChild(el('div', 'group-header', "Aujourd'hui — en cours"));
-    const current = enCoursTickets();
-    if (!current.length) panel.appendChild(el('div', 'muted small', 'Rien en cours'));
-    for (const t of current) {
-      const line = el('div', 'today-ticket-line');
-      line.appendChild(todayKeyLink(t && t.key));
-      line.appendChild(el('span', 'today-summary', (t && t.summary) || ''));
-      panel.appendChild(line);
-    }
-
-    // -- Dernière activité --
-    const ahead = el('div', 'section-head');
-    ahead.appendChild(el('span', 'section-title', 'Dernière activité'));
-    panel.appendChild(ahead);
-    const notifs = recentNotifs();
-    if (!notifs.length) panel.appendChild(el('div', 'muted small', 'Rien de neuf'));
-    for (const n of notifs) {
-      const row = el('div', 'activity-row');
-      row.appendChild(el('span', 'kind-icon', notifIcon(n)));
-      const title = el('span', 'activity-title', (n && (n.title || n.key)) || '');
-      makeLink(title, n && n.url);
-      row.appendChild(title);
-      const t = relTimeEl(n && n.date);
-      t.classList.add('muted', 'small');
-      row.appendChild(t);
-      panel.appendChild(row);
-    }
     panel.scrollTop = st;
   }
 
@@ -991,6 +1111,170 @@
     scroll.scrollTop = st;
   }
 
+  // ---------- Trouver un ticket (finder) ----------
+
+  function fetchBacklog(force) {
+    if (backlog.loading) return;
+    if (backlog.data && !force) return;
+    backlog.loading = true;
+    backlog.error = null;
+    renderFinder();
+    Promise.resolve(wd.getBacklog()).then(function (list) {
+      backlog.loading = false;
+      backlog.data = Array.isArray(list) ? list : [];
+      backlog.fetchedAt = Date.now();
+      renderFinder();
+    }).catch(function (e) {
+      backlog.loading = false;
+      backlog.error = errMsg(e);
+      renderFinder();
+    });
+  }
+
+  function difficultyTag(difficulty) {
+    const d = String(difficulty || '').toLowerCase();
+    if (d === 'easy') return el('span', 'tag easy', 'FACILE');
+    if (d === 'hard') return el('span', 'tag hard', 'COSTAUD');
+    return el('span', 'tag mid', 'MOYEN');
+  }
+
+  function assignTicket(ticket, btn) {
+    const key = ticket && ticket.key;
+    if (!key || assigning.has(key) || assigned.has(key)) return;
+    assigning.add(key);
+    assignErrors.delete(key);
+    btn.disabled = true;
+    btn.classList.add('pending');
+    btn.textContent = '…';
+    Promise.resolve(wd.assignToMe(key)).then(function () {
+      assigning.delete(key);
+      assigned.add(key);
+      renderFinder();
+    }).catch(function (e) {
+      assigning.delete(key);
+      assignErrors.set(key, errMsg(e));
+      renderFinder();
+    });
+  }
+
+  function finderCard(ticket) {
+    const card = el('div', 'card finder-card');
+    const key = ticket && ticket.key;
+
+    const top = el('div', 'row-top');
+    const title = el('div', 'card-title clamp2', (ticket && ticket.summary) || '(untitled)');
+    top.appendChild(title);
+    top.appendChild(difficultyTag(ticket && ticket.difficulty));
+    card.appendChild(top);
+
+    const foot = el('div', 'foot');
+    const keyEl = el('span', 'ticket-key mono', key || '—');
+    makeLink(keyEl, ticket && ticket.url, 'Open in Jira');
+    foot.appendChild(keyEl);
+    const typeProj = [ticket && ticket.type, ticket && ticket.project].filter(Boolean).join(' · ');
+    if (typeProj) foot.appendChild(el('span', 'muted small', typeProj));
+    foot.appendChild(el('span', 'muted small', daysAgoLabel(ticket && (ticket.updated || ticket.created))));
+
+    const btn = el('button', 'assignbtn', "Me l'assigner");
+    if (key && assigned.has(key)) {
+      btn.textContent = 'Assigné ✓';
+      btn.classList.add('taken');
+      btn.disabled = true;
+    } else if (key && assigning.has(key)) {
+      btn.textContent = '…';
+      btn.classList.add('pending');
+      btn.disabled = true;
+    }
+    btn.addEventListener('click', function (e) {
+      if (e && e.stopPropagation) e.stopPropagation();
+      assignTicket(ticket, btn);
+    });
+    foot.appendChild(btn);
+    card.appendChild(foot);
+
+    const err = key && assignErrors.get(key);
+    if (err) card.appendChild(el('div', 'error-line finder-assign-error', err));
+
+    return card;
+  }
+
+  function renderFinder() {
+    const bar = filterEls.finder;
+    const scroll = scrolls.finder;
+    const st = scroll.scrollTop || 0;
+    bar.textContent = '';
+    scroll.textContent = '';
+
+    const list = Array.isArray(backlog.data) ? backlog.data : null;
+
+    if (backlog.loading && !list) {
+      bar.classList.add('hidden');
+      scroll.appendChild(el('div', 'muted small', 'Loading…'));
+      return;
+    }
+    if (backlog.error && !list) {
+      bar.classList.add('hidden');
+      scroll.appendChild(el('div', 'error-line', backlog.error));
+      const retry = el('button', 'link-btn', 'Retry');
+      retry.addEventListener('click', function () { fetchBacklog(true); });
+      scroll.appendChild(retry);
+      return;
+    }
+    if (!list || !list.length) {
+      bar.classList.add('hidden');
+      scroll.appendChild(el('div', 'empty', "Rien de libre pour l'instant 🎉"));
+      return;
+    }
+
+    bar.classList.remove('hidden');
+    const head = el('div', 'row finder-head');
+    head.appendChild(el('span', 'section-title', 'Trouver un ticket'));
+    const dice = el('button', 'dice', 'Surprends-moi 🎲');
+    dice.addEventListener('click', onDice);
+    head.appendChild(dice);
+    bar.appendChild(head);
+
+    // Category segmented control (Bugs / Sprint PMSWEB / B2) scopes everything below it.
+    const activeCategory = FINDER_CATEGORIES.find(function (f) { return f.id === filters.finderCategory; })
+      || FINDER_CATEGORIES[0];
+    const scoped = safeFilter(list, activeCategory.test);
+
+    const segmented = el('div', 'segmented');
+    for (const def of FINDER_CATEGORIES) {
+      const seg = el('button', 'seg' + (def.id === activeCategory.id ? ' active' : ''));
+      seg.appendChild(el('span', null, def.label));
+      seg.appendChild(el('span', 'seg-count', safeFilter(list, def.test).length));
+      seg.addEventListener('click', function () { setFilter('finderCategory', def.id); });
+      segmented.appendChild(seg);
+    }
+    bar.appendChild(segmented);
+
+    const defs = FINDER_FILTERS.map(function (f) {
+      return { id: f.id, label: f.label, count: safeFilter(scoped, f.test).length };
+    });
+    bar.appendChild(chipRow(defs, filters.finder, function (id) { setFilter('finder', id); }));
+
+    const active = FINDER_FILTERS.find(function (f) { return f.id === filters.finder; }) || FINDER_FILTERS[0];
+    const visible = safeFilter(scoped, active.test);
+    if (!visible.length) {
+      scroll.appendChild(el('div', 'empty', 'Nothing matches this filter'));
+    } else {
+      for (const t of visible) scroll.appendChild(finderCard(t));
+    }
+    scroll.appendChild(el('p', 'fnd-note',
+      "Difficulté estimée depuis les story points quand ils existent, sinon calculée. « Me l'assigner » t'assigne le ticket dans Jira."));
+    scroll.scrollTop = st;
+  }
+
+  function onDice() {
+    const cards = scrolls.finder.querySelectorAll('.finder-card');
+    if (!cards.length) return;
+    const pick = cards[Math.floor(Math.random() * cards.length)];
+    cards.forEach(function (c) { c.classList.remove('highlight'); });
+    pick.classList.add('highlight');
+    pick.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+
   const RENDER = { today: renderToday, prs: renderPRs, tickets: renderTickets, notifs: renderNotifs };
 
   // ---------- snapshot handling ----------
@@ -1007,7 +1291,9 @@
         error: standup.error,
         awaiting: awaitingPRs(),
         current: enCoursTickets(),
-        recent: recentNotifs(),
+        traiter: traiterItems(),
+        unread: snap.unread,
+        name: displayNameOf(),
       });
     }
     const data = name === 'prs' ? snap.prs : (name === 'tickets' ? snap.tickets : snap.notifications);
@@ -1077,6 +1363,7 @@
       panels[key].classList.toggle('active', key === name);
     }
     if (name === 'today' && !standup.fetchedAt && !standup.loading) fetchStandup();
+    if (name === 'finder' && !backlog.data && !backlog.loading) fetchBacklog();
   }
 
   for (const name of Object.keys(tabs)) {
@@ -1092,6 +1379,10 @@
 
   collapseBtn.addEventListener('click', function () { setCollapsed(true); });
   expandBtn.addEventListener('click', function () { setCollapsed(false); });
+  topbar.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    setCollapsed(true);
+  });
   document.addEventListener('keydown', function (e) {
     if (!e || e.key !== 'Escape') return;
     if (drawer) { closeDrawer(); return; } // drawer closes first...

@@ -206,6 +206,51 @@ async function fetchMyTickets(cfg) {
   });
 }
 
+// Rough, explainable difficulty heuristic used only when the ticket carries
+// no story points: longer descriptions and "investigation-shaped" wording
+// bump the estimate up a notch; nothing here is a substitute for real triage.
+function estimateDifficulty(f) {
+  const points = f.customfield_10016 || f.customfield_10004; // common Jira Cloud story-point field ids
+  if (typeof points === 'number') {
+    if (points <= 2) return 'easy';
+    if (points <= 5) return 'medium';
+    return 'hard';
+  }
+  const text = (f.description && JSON.stringify(f.description)) || '';
+  const len = text.length;
+  const heavy = /investigat|regression|multiple|migrat|refactor|architecture/i.test(text);
+  if (heavy || len > 4000) return 'hard';
+  if (len > 1200) return 'medium';
+  return 'easy';
+}
+
+async function fetchBacklogTickets(cfg) {
+  // Recently groomed backlog only — sorting by creation date surfaces
+  // years-old orphaned tickets nobody actually wants to pick up.
+  const jql = 'assignee is EMPTY AND statusCategory = "To Do" AND type in (Bug, Story) ' +
+    'AND updated >= "-90d" ORDER BY updated DESC';
+  const fields = ['summary', 'issuetype', 'created', 'updated', 'project', 'description', 'customfield_10016', 'customfield_10004'];
+  const issues = await searchJql(cfg, jql, fields, 40);
+  return issues.map((issue) => {
+    const f = issue.fields || {};
+    return {
+      key: issue.key,
+      summary: f.summary || '',
+      type: (f.issuetype && f.issuetype.name) || '',
+      project: (f.project && f.project.key) || issue.key.split('-')[0],
+      created: f.created || '',
+      updated: f.updated || f.created || '',
+      difficulty: estimateDifficulty(f),
+      url: cfg.jira.baseUrl + '/browse/' + issue.key,
+    };
+  });
+}
+
+async function assignToMe(cfg, key) {
+  await jiraFetch(cfg, 'PUT', '/rest/api/3/issue/' + key + '/assignee',
+    { accountId: cfg.jira.myAccountId }, [204]);
+}
+
 // buildWatchlist result cache — the JQL search + readdir only need to run
 // every 10 minutes, not on every 30-second poll.
 const WATCHLIST_TTL_MS = 10 * 60 * 1000;
@@ -434,4 +479,7 @@ async function postComment(cfg, key, text) {
   return res.json();
 }
 
-module.exports = { fetchMyTickets, buildWatchlist, fetchActivity, fetchTicketDetail, postComment };
+module.exports = {
+  fetchMyTickets, buildWatchlist, fetchActivity, fetchTicketDetail, postComment,
+  fetchBacklogTickets, assignToMe,
+};

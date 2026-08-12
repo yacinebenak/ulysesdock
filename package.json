@@ -1,7 +1,7 @@
 {
   "name": "ulysesdock",
   "productName": "UlysesDock",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Side-docked Jira + Bitbucket work monitor for the Ulyses team",
   "main": "src/main.js",
   "author": "Yacine Benakmoume",
